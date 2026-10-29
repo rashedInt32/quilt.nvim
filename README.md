@@ -93,7 +93,7 @@ back to its own file. `+`, `-`, `zd`, and `:Quilt refresh` change only what
 the quilt shows, so they clear the quilt's undo history. Each file keeps its
 own.
 
-Two edges I know about:
+Edges I know about:
 
 - `:m` across an excerpt edge carries the edge with the line, because Neovim
   moves marks with the text `:m` moves. The headers show where the line went,
