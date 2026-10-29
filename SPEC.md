@@ -198,8 +198,11 @@ Rules:
 - `apply_quilt_change(first, last, lines, prefer)` is called after quilt rows
   `[first, last)` became `lines`.
   - Rows removed from each span leave that span's source.
-  - All new lines go to the first span the change touches, at the matching
-    source row.
+  - New lines are dealt out row for row: each touched span, in order, gets
+    as many new lines as it had rows in the change, until the lines run out.
+    The last touched span also gets any lines left over. So `:%s` and `>`
+    keep every line in its own file, and `J` across an edge keeps the joined
+    line in the first file and removes it from the second.
   - A pure insertion (`first == last`) at a boundary goes to the span above
     when `prefer == "above"` and to the span below when `prefer == "below"`.
     At row 0 it goes to the first span, and at the end it goes to the last.
@@ -236,8 +239,9 @@ S.to_ranges(hits, context)      -- loads buffers -> quilt.Range[]
 
 - `to_ranges` resolves `path` to a bufnr with `bufadd` and `bufload`, marks
   buffers it created as unlisted, and pads each hit by `context` rows clamped
-  to the file. It returns the bufnrs it created so the quilt can unload them
-  later.
+  to the file. It returns the bufnrs it loaded, meaning every buffer that
+  was not loaded before the call, so the quilt can unload them later. A
+  quickfix list makes buffers without loading them, and those count.
 - Hits for files that can't be read are dropped with one notice that names
   how many were dropped.
 - `parse_diff` returns one hit per hunk in the new file. A pure deletion
@@ -300,10 +304,15 @@ The sync layer. It owns the model, the quilt buffer, and all attachments.
 ```lua
 local B = require("quilt.buffer")
 B.open(ranges, opts)   -- create and show a quilt; returns qbuf
-B.get(qbuf)            -- state | nil
+B.get(qbuf)            -- state | nil; state.model is the quilt's model
 B.resync(qbuf)         -- reread every span from its source
 B.write(qbuf)          -- write changed sources
+B.pending(qbuf)        -- number of queued edits not yet applied
+B.flush(qbuf)          -- apply queued edits now (not from inside on_lines)
 ```
+
+`opts` for `open`: `title` (string), `created` (bufnrs the quilt may unload
+later), `win` (window to show it in, default current).
 
 How sync works:
 
@@ -320,7 +329,10 @@ How sync works:
 5. A source change that arrives while quilt edits are still queued would see
    a model ahead of its buffer. In that case the quilt flushes first, then
    rereads every span (`resync`).
-6. `on_reload` of a source calls `model:clamp`.
+6. `on_reload` of a source calls `model:clamp`. `:e!` detaches instead of
+   reloading. So `on_detach` checks on the next tick: when the source is
+   loaded again, it attaches again and clamps. Only when it stays unloaded
+   are its spans removed.
 7. When the quilt is wiped, every callback returns true to detach. Buffers
    the quilt loaded are unloaded when they are not modified and not shown.
 
