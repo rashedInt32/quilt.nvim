@@ -151,6 +151,8 @@ and drives it with keys.
   walks.
 - tests/test_e2e_regress.lua: one test per bug found in review or in the
   real-project session.
+- tests/test_e2e_review.lua: the second code review's repro cases.
+- Every known v1 limit is a skipped test that names it (SPEC "Known limits").
 
 ## 7. review gates
 

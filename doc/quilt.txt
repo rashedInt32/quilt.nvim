@@ -37,8 +37,9 @@ grn         rename
 gra         code action
 grr         references, as a new quilt
 
-The quilt also maps `o`, `O`, `u`, `U`, `<C-r>`, `g-` and `g+` to themselves.
-They record which excerpt a new line at an edge belongs to.
+The quilt also maps `o`, `O`, `p`, `P`, `]p`, `[p`, `gp` and `gP` to
+themselves. They record which excerpt a new line at an edge belongs to. Puts
+are left alone when you have mapped them yourself.
 
 ==============================================================================
 EDITING                                                       *quilt-editing*
@@ -56,6 +57,10 @@ Known limits:
   show where it went, and |:w| writes what you see.
 - When a file and the quilt change the same excerpt in the same moment, the
   file's version wins, with an error notice.
+- A put at an edge inside |:normal!| or a fast macro, and |g-| or |g+| across
+  undo branches, can put the line in the excerpt next to it.
+- |u| in the quilt undoes the latest change it shows, even one made to the
+  file from another window.
 
 ==============================================================================
 CONFIG                                                        *quilt-config*

@@ -361,12 +361,18 @@ How sync works:
    Every source keeps a cached copy of its lines. Its changes are diffed with
    `vim.diff` against that copy, so a formatter that rewrites the whole file
    only touches the spans near rows that really changed.
-10. Keys in the quilt record intent: `o` and `O` say which side a new line
-   belongs to, even inside `:g` and `:normal`. `u`, `U`, `g-` mark an undo,
-   so restored marks are trusted. `<C-r>` and `g+` mark a redo, which reuses
-   the side the first run chose (kept per undo sequence number). Other pure
-   line insertions (`p`, `P`, `:put`, `.`) use the cursor row before the
-   edit, and only when the command did nothing else.
+10. Keys in the quilt record intent: `o`, `O`, and the puts (`p`, `P`, `]p`,
+   `[p`, `gp`, `gP`) say which side a new line belongs to, even inside `:g`
+   and `:normal`. Puts are only mapped when the user hasn't mapped them.
+   Other pure line insertions (`:put`, `.`, `:normal! p`) use the cursor row
+   before the edit, and only when the command did nothing else.
+   After every sync, and before each key while the quilt has unsynced edits,
+   the quilt stores which rows each span owns, keyed by its undo sequence
+   number. Undo and redo always land on a state seen before, so any way back
+   (`u`, `10u`, `<C-r>`, `:undo 3`) replays that layout instead of reading
+   marks. View edits clear the stored layouts along with the undo history.
+   A source hunk with more than 20 paired rows is applied row by row, so
+   `:%s` over a whole file doesn't grow an excerpt to cover it.
 11. A same-size rewrite of a range that drops several marks onto one row, as
    `:sort` does, keeps each span's rows in place.
 12. `on_reload` of a source calls `model:clamp`. Some reloads detach instead.
@@ -389,6 +395,17 @@ quilt's modified flag. `:w {file}` writes nothing and says so.
   went, and `:w` writes what it shows.
 - When two quilts change the same excerpt of one file in the same tick, the
   second keeps the file's version and shows an error notice.
+- A put at an excerpt edge inside `:normal!` or fast typeahead, where
+  mappings and CursorMoved don't run, can join the excerpt below.
+- Moving across undo branches (`g-`, `g+`, `:earlier`) can put a line at an
+  edge into the excerpt next to it.
+- `u` in the quilt undoes the latest change it shows, including a change made
+  to the file from another window, the way two windows on one buffer behave.
+- A race between a quilt edit and a source edit rereads the quilt, which
+  clears its undo history.
+
+Each limit has a skipped test that names it, so a fix shows up as a test to
+turn back on.
 
 ## Out of scope for v1
 

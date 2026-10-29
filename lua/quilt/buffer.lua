@@ -9,13 +9,19 @@ local M = {}
 local states = {}
 local counter = 0
 local RENDER_DELAY = 40
+local BIG_HUNK = 20
 
 local function notify(msg, level)
   vim.notify("quilt: " .. msg, level or vim.log.levels.WARN)
 end
 
 local function alive(st)
-  return st and not st.dead and api.nvim_buf_is_valid(st.qbuf)
+  return st and not st.dead and api.nvim_buf_is_valid(st.qbuf) and api.nvim_buf_is_loaded(st.qbuf)
+end
+
+-- t[i..j] as a new list. `unpack` fails past about 8000 values in LuaJIT.
+local function slice(t, i, j)
+  return vim.list_slice(t, i, j)
 end
 
 local NS = api.nvim_create_namespace("quilt.marks")
@@ -49,6 +55,7 @@ local function without_undo(st, fn)
   vim.bo[st.qbuf].undolevels = -1
   fn()
   vim.bo[st.qbuf].undolevels = levels
+  st.layouts = {}
 end
 
 local function sync_modified(st)
@@ -100,11 +107,15 @@ local function place_marks(st)
   for _, s in ipairs(st.model:spans()) do
     seen[s.id] = true
     local row, col = s.q_start, 0
-    if row >= n then
-      row, col = n - 1, last_len
-    end
     local r, c = mark_pos(st, s)
-    if r ~= row or c ~= col then
+    local keep = false
+    if row >= n then
+      -- Collapsed at the end. Neovim parks such a mark past the last row and undo restores it from there, so a
+      -- mark already at or past the last row stays put.
+      row, col = n - 1, last_len
+      keep = r ~= nil and r >= n - 1
+    end
+    if not keep and (r ~= row or c ~= col) then
       st.marks[s.id] = api.nvim_buf_set_extmark(st.qbuf, NS, row, col, { id = st.marks[s.id], right_gravity = false })
     end
   end
@@ -123,10 +134,16 @@ local attach_source
 local function snapshot(st)
   local spans = st.model:spans()
   local lines = api.nvim_buf_get_lines(st.qbuf, 0, -1, false)
-  st.base = { spans = spans, rows = {} }
+  local seq = vim.fn.undotree(st.qbuf).seq_cur
+  st.base = { spans = spans, rows = {}, n = #lines, seq = seq }
+  local counts = {}
   for _, s in ipairs(spans) do
-    st.base.rows[s.id] = { unpack(lines, s.q_start + 1, s.q_start + s.count) }
+    st.base.rows[s.id] = slice(lines, s.q_start + 1, s.q_start + s.count)
+    counts[s.id] = s.count
   end
+  -- Undo and redo land on a state seen before. Remember who owned which rows in each one, so any way back
+  -- (`10u`, `g-`, `:earlier`, `:undo 3`) replays it exactly instead of guessing from marks.
+  st.layouts[seq] = counts
 end
 
 local function rebuild(st)
@@ -163,14 +180,15 @@ local function derive_starts(st, spans)
     end
     all_top = all_top and r == 0 and c == 0
     local row = r
-    if c > 0 then
+    if s.count == 0 and s.q_start >= st.base.n then
+      -- Collapsed at the end. Only undo, which puts its mark back at col 0 past the old end, brings it back.
+      row = (c == 0 and r >= st.base.n) and r or n
+    elseif c > 0 then
       row = r + 1
-    elseif r == n - 1 and lines[n] == "" and s.count == 0 then
-      row = n -- still collapsed at the end; the empty last line is not its row
     end
     starts[i] = math.min(math.max(row, starts[i - 1] or 0), n)
   end
-  if n == 1 and lines[1] == "" and all_top then
+  if st.wiped and n == 1 and lines[1] == "" and all_top then
     for i in ipairs(starts) do
       starts[i] = n
     end
@@ -197,10 +215,6 @@ local function settle_insertion(st, p, count, above)
   end
   if not owner then
     return
-  end
-  local nxt = spans[owner + 1] and mark_pos(st, spans[owner + 1]) or api.nvim_buf_line_count(st.qbuf)
-  if nxt == p + count then
-    return -- undo or redo put this span's rows back
   end
   if above then
     for _, s in ipairs(at) do
@@ -234,28 +248,69 @@ local function same(a, b)
   return true
 end
 
+-- Row starts from a layout stored for an undo state, or nil when it no longer fits the quilt.
+local function layout_starts(st, spans, counts)
+  local n = api.nvim_buf_line_count(st.qbuf)
+  local lines = api.nvim_buf_get_lines(st.qbuf, 0, -1, false)
+  local starts, row = {}, 0
+  for i, s in ipairs(spans) do
+    starts[i] = row
+    row = row + (counts[s.id] or 0)
+  end
+  if row == n then
+    return starts, lines, n
+  end
+  if row == 0 and n == 1 and lines[1] == "" then
+    for i in ipairs(starts) do
+      starts[i] = n -- every span collapsed; the one empty line is no span's row
+    end
+    return starts, lines, n
+  end
+end
+
+-- Between commands that run before a flush (a macro, `dd.` typed fast), record who owns which rows now, so
+-- undo can land on that state too. Marks still describe the last command here, before the next key runs.
+local function record_between(st)
+  local seq = vim.fn.undotree(st.qbuf).seq_cur
+  if st.layouts[seq] then
+    return
+  end
+  -- The command is over, so a pending put or `.` at an edge did nothing else: decide it now.
+  local ins = st.pending_ins
+  if ins then
+    settle_insertion(st, ins[1], ins[2], ins[3])
+    st.pending_ins = nil
+  end
+  local spans = st.base.spans
+  local starts, _, n = derive_starts(st, spans)
+  local counts = {}
+  for i, s in ipairs(spans) do
+    counts[s.id] = (starts[i + 1] or n) - starts[i]
+  end
+  st.layouts[seq] = counts
+end
+
 -- Push what the user changed in the quilt into the sources, span by span, against the last snapshot.
 local function commit(st)
   st.dirty = false
-  local seq = vim.fn.undotree(st.qbuf).seq_cur
-  local ins = st.pending_ins
-  if ins then
-    -- Redo replays the side the first run chose.
-    local above = ins.redo and st.sides[seq] or (not ins.redo and ins[3])
-    if settle_insertion(st, ins[1], ins[2], above) and above then
-      st.settled_above = true
-    end
-  end
-  if st.settled_above then
-    st.sides[seq] = true
-  end
-  st.pending_ins, st.settled_above = nil, nil
   local spans = st.base.spans
-  local starts, qlines, n = derive_starts(st, spans)
+  local seq = vim.fn.undotree(st.qbuf).seq_cur
+  local starts, qlines, n
+  if seq ~= st.base.seq and st.layouts[seq] then
+    starts, qlines, n = layout_starts(st, spans, st.layouts[seq])
+  end
+  if not starts then
+    local ins = st.pending_ins
+    if ins then
+      settle_insertion(st, ins[1], ins[2], ins[3])
+    end
+    starts, qlines, n = derive_starts(st, spans)
+  end
+  st.pending_ins, st.wiped = nil, nil
   local conflict, broke = false, {}
   for i, s in ipairs(spans) do
     local base = st.base.rows[s.id]
-    local new = { unpack(qlines, starts[i] + 1, starts[i + 1] or n) }
+    local new = slice(qlines, starts[i] + 1, starts[i + 1] or n)
     if not same(base, new) then
       local span = st.model:find(s.id)
       local loaded = span and api.nvim_buf_is_loaded(span.src)
@@ -268,7 +323,7 @@ local function commit(st)
         broke[span.src] = true
       else
         local pre, suf = trim(base, new)
-        local e = st.model:replace(s.id, pre, #base - suf, { unpack(new, pre + 1, #new - suf) })
+        local e = st.model:replace(s.id, pre, #base - suf, slice(new, pre + 1, #new - suf))
         if not st.undo_broken[e.src] then
           st.undo_broken[e.src] = true
           break_undo(e.src)
@@ -350,7 +405,8 @@ end
 -- A formatter may replace a whole file to change two lines. Diff against our copy of the source so only the
 -- rows that really changed reach the model, and excerpts don't swallow the file.
 local function source_hunks(old, new, first)
-  if #old + #new <= 4 then
+  -- vim.diff reads an empty side as one empty line, so those never go through it.
+  if #old + #new <= 4 or #old == 0 or #new == 0 then
     return { { first, first + #old, new } }
   end
   local hunks = {}
@@ -361,7 +417,18 @@ local function source_hunks(old, new, first)
   for _, h in ipairs(indices) do
     local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
     local row = first + (ca > 0 and sa - 1 or sa) + offset
-    hunks[#hunks + 1] = { row, row + ca, cb > 0 and { unpack(new, sb, sb + cb - 1) } or {} }
+    -- A big hunk (`:%s` over a whole file) goes row by row, so an excerpt doesn't grow to cover the file.
+    -- A small one grows the excerpts it touches, so the whole change shows.
+    local pairs_n = math.min(ca, cb)
+    if pairs_n <= BIG_HUNK then
+      pairs_n = 0
+    end
+    for k = 0, pairs_n - 1 do
+      hunks[#hunks + 1] = { row + k, row + k + 1, { new[sb + k] } }
+    end
+    if pairs_n == 0 or ca ~= cb then
+      hunks[#hunks + 1] = { row + pairs_n, row + ca, slice(new, sb + pairs_n, sb + cb - 1) }
+    end
     offset = offset + cb - ca
   end
   return hunks
@@ -388,14 +455,16 @@ function attach_source(st, src)
         return true
       end
       local cache = st.cache[buf]
-      local old = { unpack(cache, first + 1, last_old) }
+      local old = slice(cache, first + 1, last_old)
       local lines = api.nvim_buf_get_lines(buf, first, last_new, false)
-      for _ = first + 1, last_old do
-        table.remove(cache, first + 1)
+      local delta = #lines - #old
+      if delta ~= 0 then
+        table.move(cache, last_old + 1, #cache, last_old + 1 + delta)
+        for k = #cache, #cache + delta + 1, -1 do
+          cache[k] = nil
+        end
       end
-      for i, l in ipairs(lines) do
-        table.insert(cache, first + i, l)
-      end
+      table.move(lines, 1, #lines, first + 1, cache)
       if st.applying[buf] then
         return
       end
@@ -499,6 +568,10 @@ function on_quilt_lines(st, first, last_old, last_new)
   if #st.queue > 0 then
     st.raced = true
   end
+  local n = api.nvim_buf_line_count(st.qbuf)
+  -- Every row went (`:%d`, `ggdG`): the one empty line Neovim keeps belongs to no span.
+  -- Neovim reports it as zero new lines, though the buffer keeps one.
+  st.wiped = first == 0 and last_new == 0 and n == 1 and last_old == st.base.n
   if not st.dirty and last_old == last_new and last_old - first > 1 then
     keep_rows(st, first, last_old)
   end
@@ -511,14 +584,13 @@ function on_quilt_lines(st, first, last_old, last_new)
       st.pending_ins = nil
     end
   end
-  if first == last_old and last_new > first and st.undo_kind ~= "undo" then
+  if first == last_old and last_new > first then
     if st.intent then
-      if settle_insertion(st, first, last_new - first, st.intent == "above") then
-        st.settled_above = true
-      end
+      settle_insertion(st, first, last_new - first, st.intent == "above")
+      st.intent = nil -- one insertion per `o` or `O`
     elseif not st.dirty then
-      -- Decided at the flush, and only when the command did nothing else (`p`, `P`, `:put`, `.`, redo).
-      st.pending_ins = { first, last_new - first, st.last_row < first, redo = st.undo_kind == "redo" }
+      -- Decided at the flush, and only when the command did nothing else (`:put`, `.`, `:normal! p`).
+      st.pending_ins = { first, last_new - first, st.last_row < first }
     end
   end
   st.dirty = true
@@ -545,6 +617,7 @@ local function cleanup(st)
   end
   st.dead = true
   states[st.qbuf] = nil
+  vim.on_key(nil, api.nvim_create_namespace("quilt.keys." .. st.qbuf))
   st.timer:stop()
   st.timer:close()
   local qbuf = st.qbuf
@@ -699,24 +772,22 @@ end
 local function set_keys(st, opts)
   -- `o` and `O` say which excerpt a new line at an edge belongs to, even inside `:g` and `:normal`,
   -- where CursorMoved doesn't fire.
-  -- Undo puts marks back where they were; the cursor rule must not move them again.
-  for lhs, kind in pairs({ u = "undo", U = "undo", ["g-"] = "undo", ["<C-r>"] = "redo", ["g+"] = "redo" }) do
-    vim.keymap.set("n", lhs, function()
-      st.undo_kind = kind
-      vim.schedule(function()
-        st.undo_kind = nil
-      end)
-      return lhs
-    end, { buffer = st.qbuf, expr = true, desc = "quilt: " .. kind })
+  -- Puts say the same, when the user hasn't mapped them (yanky and friends keep working).
+  local sides = { o = "above", O = "below" }
+  local puts = { p = "above", ["]p"] = "above", gp = "above", P = "below", ["[p"] = "below", gP = "below" }
+  for lhs, side in pairs(puts) do
+    if vim.fn.maparg(lhs, "n") == "" then
+      sides[lhs] = side
+    end
   end
-  for lhs, side in pairs({ o = "above", O = "below" }) do
+  for lhs, side in pairs(sides) do
     vim.keymap.set("n", lhs, function()
       st.intent = side
       vim.schedule(function()
         st.intent = nil
       end)
       return lhs
-    end, { buffer = st.qbuf, expr = true, desc = "quilt: open line" })
+    end, { buffer = st.qbuf, expr = true, desc = "quilt: new line at an excerpt edge" })
   end
   local acts = actions(st, opts)
   for name, lhs in pairs(opts.keys or {}) do
@@ -741,7 +812,7 @@ function M.open(ranges, opts)
   opts = opts or {}
   opts.context = opts.context or 3
   counter = counter + 1
-  local qbuf = api.nvim_create_buf(false, false)
+  local qbuf = api.nvim_create_buf(true, false) -- listed, so `:bd` fires BufDelete
   local st = {
     qbuf = qbuf,
     model = Model.new(ranges),
@@ -752,7 +823,7 @@ function M.open(ranges, opts)
     created = {},
     marks = {},
     cache = {},
-    sides = {},
+    layouts = {},
     undo_broken = {},
     last_row = 0,
     timer = assert(vim.uv.new_timer()),
@@ -764,6 +835,11 @@ function M.open(ranges, opts)
     st.touched[s.src] = true
   end
   states[qbuf] = st
+  vim.on_key(function()
+    if st.dirty and not st.dead and api.nvim_get_current_buf() == qbuf then
+      record_between(st)
+    end
+  end, api.nvim_create_namespace("quilt.keys." .. qbuf))
 
   api.nvim_buf_set_name(qbuf, ("quilt://%d/%s"):format(counter, opts.title or "quilt"))
   vim.bo[qbuf].buftype = "acwrite"
@@ -821,6 +897,14 @@ function M.open(ranges, opts)
     buffer = qbuf,
     callback = function()
       setup_window(api.nvim_get_current_win())
+    end,
+  })
+  -- Commit what's pending before the text goes, so `:bd!` or `:e!` right after an edit can't lose or misplace it.
+  api.nvim_create_autocmd("BufUnload", {
+    group = group,
+    buffer = qbuf,
+    callback = function()
+      M.flush(qbuf)
     end,
   })
   api.nvim_create_autocmd({ "BufDelete", "BufWipeout" }, {

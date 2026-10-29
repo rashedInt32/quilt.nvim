@@ -101,6 +101,14 @@ Two edges I know about:
 - If a file and the quilt change the same excerpt in the same moment, as with
   two quilts over one file under `:windo`, the file's version wins and quilt
   says so.
+- A put at an edge inside `:normal!` or a fast macro can join the excerpt
+  below, and `g-`/`g+` across undo branches can do the same.
+- `u` in the quilt undoes the last change it shows, even one made to the file
+  from another window. That's how two windows on one buffer behave too.
+
+The quilt maps `o`, `O`, and the puts (`p`, `P`, `]p`, `[p`, `gp`, `gP`) so a
+new line at an edge lands where I meant it. Puts are left alone when I've
+mapped them myself.
 
 ## Not yet
 
