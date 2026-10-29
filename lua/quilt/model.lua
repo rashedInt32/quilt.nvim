@@ -1,9 +1,10 @@
 -- The excerpt model: which source rows each quilt row shows. Plain Lua, no Neovim.
 --
 -- All rows are 0-based and ranges end-exclusive. Spans live in quilt order as
--- { id, src, start, count }; quilt rows are derived by summing counts. Every
--- method that changes state returns the edits that bring the other side in
--- line, valid when applied in list order.
+-- { id, src, start, count }; quilt rows are derived by summing counts. A span
+-- with count 0 is collapsed: it keeps its id and place so undo can refill it.
+-- Every method that changes state returns the edits that bring the other side
+-- in line, valid when applied in list order.
 local M = {}
 
 ---@class quilt.Range
@@ -155,80 +156,33 @@ function Model:find(id)
   return i and snapshot(self._spans[i], q)
 end
 
---- Quilt rows [first, last) became `lines`. Returns the source edits.
---- Each touched span gets as many new lines as it lost rows, in quilt order,
---- and the last one also gets any left over. `prefer` ("above" | "below",
---- default "below") picks the span for a pure insertion at a boundary.
----@param first integer
----@param last integer
+--- Rows [rel_first, rel_last) of a span, counted from its first row, became
+--- `lines`. Returns the source edit; the span may collapse to 0 rows.
+---@param id integer
+---@param rel_first integer
+---@param rel_last integer
 ---@param lines string[]
----@param prefer? "above"|"below"
----@return quilt.SrcEdit[]
-function Model:apply_quilt_change(first, last, lines, prefer)
-  local spans, k, edits = self._spans, #lines, {}
-  if first == last then
-    if k == 0 then
-      return edits
-    end
-    local q = 0
-    for i, s in ipairs(spans) do
-      local e = q + s.count
-      local inside = first >= q and first < e
-      local append = first == e and (i == #spans or prefer == "above")
-      if inside or append then
-        local row = s.start + first - q
-        edits[1] = { src = s.src, first = row, last = row, lines = copy(lines) }
-        s.count = s.count + k
-        for j = i + 1, #spans do
-          if spans[j].src == s.src then
-            spans[j].start = spans[j].start + k
-          end
-        end
-        break
-      end
-      q = e
-    end
-    return edits
+---@return quilt.SrcEdit?
+function Model:replace(id, rel_first, rel_last, lines)
+  local i = self:_index(id)
+  if not i then
+    return nil
   end
-
-  -- Lines are dealt out row for row; the last touched span takes the rest.
-  local tail, q = nil, 0
-  for i, s in ipairs(spans) do
-    if q < last and q + s.count > first then
-      tail = i
+  local spans = self._spans
+  local s = spans[i]
+  local delta = #lines - (rel_last - rel_first)
+  s.count = s.count + delta
+  for j = i + 1, #spans do
+    if spans[j].src == s.src then
+      spans[j].start = spans[j].start + delta
     end
-    q = q + s.count
   end
-  -- Spans of one source come in row order, so earlier edits of a source sit
-  -- above later ones and `off` shifts the later rows.
-  local off, out, used = {}, {}, 0
-  q = 0
-  for i, s in ipairs(spans) do
-    local e = q + s.count
-    local d = off[s.src] or 0
-    s.start = s.start + d
-    if e > first and q < last then
-      local lo = math.max(first, q)
-      local removed = math.min(last, e) - lo
-      local take = i == tail and k - used or math.min(removed, k - used)
-      local new = copy(lines, used + 1, used + take)
-      used = used + take
-      local row = s.start + lo - q
-      edits[#edits + 1] = { src = s.src, first = row, last = row + removed, lines = new }
-      s.count = s.count - removed + take
-      off[s.src] = d + take - removed
-    end
-    if s.count > 0 then
-      out[#out + 1] = s
-    end
-    q = e
-  end
-  self._spans = out
-  return edits
+  return { src = s.src, first = s.start + rel_first, last = s.start + rel_last, lines = copy(lines) }
 end
 
 --- Source rows [first, last) of `src` became `lines`. Returns the quilt edits.
---- They always carry literal lines.
+--- They always carry literal lines. A collapsed span inside the change, or at
+--- its edge when the change grows a span, goes; elsewhere it only shifts.
 ---@param src integer
 ---@param first integer
 ---@param last integer
@@ -240,40 +194,49 @@ function Model:apply_source_change(src, first, last, lines)
   if first == last and k == 0 then
     return edits
   end
+  local grows = false
+  for _, s in ipairs(self._spans) do
+    if s.src == src and s.count > 0 and s.start < last and s.start + s.count > first then
+      grows = true
+    end
+  end
   local merged, old_end, qf, ql
   local out, q = {}, 0
   for _, s in ipairs(self._spans) do
-    local keep = true
-    if s.src == src then
-      local a, b = s.start, s.start + s.count
-      if first == last then
-        if first <= a then
-          s.start = a + k
-        elseif first < b then
-          local row = q + first - a
-          edits[1] = { first = row, last = row, lines = copy(lines) }
-          s.count = s.count + k
-        end
+    local keep, c = true, s.count
+    local a, b = s.start, s.start + c
+    local mine = s.src == src
+    if mine and first == last then
+      if first <= a then
+        s.start = a + k
+      elseif first < b then
+        local row = q + first - a
+        edits[1] = { first = row, last = row, lines = copy(lines) }
+        s.count = c + k
+      end
+    elseif mine and c == 0 then
+      if (first < a and a < last) or (grows and (a == first or a == last)) then
+        keep = false
       elseif last <= a then
         s.start = a + delta
-      elseif first < b then
-        if merged then
-          keep = false
-        else
-          merged = s
-          qf = q + math.max(0, first - a)
-          s.start = math.min(a, first)
-        end
-        ql = q + math.min(b, last) - a
-        old_end = math.max(b, last)
       end
-      q = q + b - a
-    else
-      q = q + s.count
+    elseif mine and last <= a then
+      s.start = a + delta
+    elseif mine and first < b then
+      if merged then
+        keep = false
+      else
+        merged = s
+        qf = q + math.max(0, first - a)
+        s.start = math.min(a, first)
+      end
+      ql = q + math.min(b, last) - a
+      old_end = math.max(b, last)
     end
     if keep then
       out[#out + 1] = s
     end
+    q = q + c
   end
   if merged then
     merged.count = old_end + delta - merged.start
@@ -353,6 +316,9 @@ function Model:shrink(id, above, below)
     return {}
   end
   local s, edits = self._spans[i], {}
+  if s.count <= 1 then
+    return edits
+  end
   above, below = math.max(0, above), math.max(0, below)
   local room = s.count - 1
   local ta, tb = above, below
@@ -381,11 +347,12 @@ function Model:remove(id)
     return {}
   end
   local s = table.remove(self._spans, i)
-  return { { first = q, last = q + s.count, lines = {} } }
+  return s.count > 0 and { { first = q, last = q + s.count, lines = {} } } or {}
 end
 
 --- `src` was reloaded and now has `src_line_count` rows. Spans past the end
---- shrink or go, and every remaining span of `src` is reread.
+--- shrink or go, and every remaining span of `src` is reread. A collapsed
+--- span stays while its row is at most the new line count.
 ---@param src integer
 ---@param src_line_count integer
 ---@return quilt.QEdit[]
@@ -393,7 +360,11 @@ function Model:clamp(src, src_line_count)
   local out, edits, q = {}, {}, 0
   for _, s in ipairs(self._spans) do
     local c = s.count
-    if s.src == src then
+    if s.src == src and c == 0 then
+      if s.start <= src_line_count then
+        out[#out + 1] = s
+      end
+    elseif s.src == src then
       local keep = math.min(c, src_line_count - s.start)
       if keep <= 0 then
         edits[#edits + 1] = { first = q, last = q + c, lines = {} }

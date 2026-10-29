@@ -181,14 +181,15 @@ function M.rename(pos, new_name)
   vim.ui.input({ prompt = "New name: ", default = word }, send)
 end
 
-local function run_action(client, action)
+local function run_action(client, action, src)
   local enc = client.offset_encoding or "utf-16"
   if action.edit then
     vim.lsp.util.apply_workspace_edit(action.edit, enc)
   end
   local command = type(action.command) == "table" and action.command or (action.command and action)
   if command then
-    client:exec_cmd(command, { bufnr = nil })
+    -- Without bufnr the command runs against the current buffer, which is the quilt.
+    client:exec_cmd(command, { bufnr = src })
   end
 end
 
@@ -226,10 +227,10 @@ function M.code_action(pos)
           if err then
             return report(err)
           end
-          run_action(client, resolved or action)
+          run_action(client, resolved or action, pos.src)
         end, pos.src)
       else
-        run_action(client, action)
+        run_action(client, action, pos.src)
       end
     end)
   end

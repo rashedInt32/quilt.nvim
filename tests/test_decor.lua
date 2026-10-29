@@ -159,21 +159,86 @@ T["diagnostics inside spans show on mapped rows, outside are skipped"] = functio
   local ns = vim.api.nvim_create_namespace("quilt.test.diag")
   vim.diagnostic.set(ns, a, {
     { lnum = 0, col = 0, message = "out above" },
-    { lnum = 2, col = 1, end_lnum = 2, end_col = 1, message = "in", severity = 1 },
-    { lnum = 3, col = 0, end_lnum = 4, end_col = 1, message = "crosses" },
+    { lnum = 2, col = 1, end_lnum = 2, end_col = 1, message = "in\nsecond line", severity = 1 },
+    { lnum = 3, col = 0, end_lnum = 4, end_col = 1, message = "crosses", severity = 2 },
     { lnum = 4, col = 0, message = "out below" },
   })
   local q, spans = quilt_of({ { src = a, start = 2, count = 2 } })
   D.render(q, spans)
-  local got = vim.diagnostic.get(q)
-  table.sort(got, function(x, y)
-    return x.lnum < y.lnum
-  end)
-  eq(#got, 2)
-  eq({ got[1].lnum, got[1].col, got[1].message, got[1].severity }, { 0, 1, "in", 1 })
-  eq({ got[2].lnum, got[2].message, got[2].end_lnum }, { 1, "crosses", 1 })
+  local ms = marks(q, "quilt.decor.diagnostics")
+  eq(#ms, 2)
+  eq({ ms[1][2], ms[1][3] }, { 0, 1 })
+  eq(ms[1][4].hl_group, "DiagnosticUnderlineError")
+  eq(ms[1][4].sign_hl_group, "DiagnosticSignError")
+  eq(ms[1][4].virt_text[1], { "in", "DiagnosticVirtualTextError" })
+  eq(ms[2][2], 1)
+  eq(ms[2][4].end_row, 2)
+  eq(ms[2][4].sign_text:gsub("%s", ""), "W")
   D.render(q, spans)
-  eq(#vim.diagnostic.get(q), 2)
+  eq(#marks(q, "quilt.decor.diagnostics"), 2)
+end
+
+T["diagnostics stay out of the global diagnostic store"] = function()
+  local a = mkbuf({ "a", "b" })
+  vim.diagnostic.set(vim.api.nvim_create_namespace("quilt.test.diag2"), a, { { lnum = 0, col = 0, message = "x" } })
+  local q, spans = quilt_of({ { src = a, start = 0, count = 2 } })
+  D.render(q, spans)
+  eq(#vim.diagnostic.get(q), 0)
+  eq(#marks(q, "quilt.decor.diagnostics"), 1)
+end
+
+T["spans with count 0 are skipped"] = function()
+  local a = mkbuf({ "a", "b" })
+  local q, spans = quilt_of({ { src = a, start = 0, count = 2 } })
+  table.insert(spans, { id = 9, src = a, src_start = 0, q_start = 2, count = 0 })
+  D.render(q, spans)
+  eq(#marks(q, "quilt.decor.headers"), 1)
+end
+
+T["only spans near the visible rows are highlighted"] = function()
+  local src_lines = {}
+  for i = 1, 200 do
+    src_lines[i] = "local v" .. i .. " = " .. i
+  end
+  local a = mkbuf(src_lines, nil, "lua")
+  local parts = {}
+  for i = 0, 99 do
+    parts[#parts + 1] = { src = a, start = i * 2, count = 1 }
+  end
+  local q, spans = quilt_of(parts)
+  vim.cmd("silent! only")
+  vim.api.nvim_set_current_buf(q)
+  vim.cmd("resize 10")
+  D.render(q, spans)
+  local max_row = 0
+  for _, m in ipairs(marks(q, "quilt.decor.highlights")) do
+    max_row = math.max(max_row, m[2])
+  end
+  eq(max_row > 0, true)
+  eq(max_row < 60, true)
+  vim.api.nvim_win_set_cursor(0, { 100, 0 })
+  D.render_visible(q)
+  local rows = {}
+  for _, m in ipairs(marks(q, "quilt.decor.highlights")) do
+    rows[#rows + 1] = m[2]
+  end
+  table.sort(rows)
+  eq(rows[1] > 40, true)
+  eq(rows[#rows] >= 99, true)
+end
+
+T["statuscolumn works in a window that is not current"] = function()
+  local a = mkbuf({ "1", "2", "3", "4", "5", "6" })
+  local q, spans = quilt_of({ { src = a, start = 3, count = 2 } })
+  D.render(q, spans)
+  vim.cmd("silent! only")
+  local other = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(other, q)
+  vim.cmd("vsplit")
+  vim.api.nvim_win_set_buf(0, mkbuf({ "x" }))
+  local res =
+    vim.api.nvim_eval_statusline(D.statuscolumn, { winid = other, use_statuscol_lnum = 1, highlights = false })
+  eq(vim.trim(res.str), "4")
 end
 
 T["show_top makes the first header visible"] = function()

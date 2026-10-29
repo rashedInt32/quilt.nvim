@@ -181,7 +181,9 @@ T["dd on the only row of an excerpt deletes the source row and the excerpt"] = f
   eq(H.disk(a), H.lines("a", 10))
   eq(H.quilt_lines(child, qbuf), { "a8", "b2" })
   eq(H.spans_of(child, qbuf, a), { { 6, 1 } })
-  eq(#H.spans(child, qbuf), 2)
+  eq(#vim.tbl_filter(function(s)
+    return s.count > 0
+  end, H.spans(child, qbuf)), 2)
   H.check(child, qbuf)
 end
 

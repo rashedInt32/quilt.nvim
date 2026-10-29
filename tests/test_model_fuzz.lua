@@ -135,8 +135,8 @@ local function check(w)
   local spans, q, seen, ids, last_src = w.m:spans(), 0, {}, {}, nil
   local ends = {}
   for i, sp in ipairs(spans) do
-    if sp.count < 1 then
-      fail(w, "span " .. i .. " has count < 1")
+    if sp.count < 0 then
+      fail(w, "span " .. i .. " has count < 0")
     end
     if sp.q_start ~= q then
       fail(w, "span " .. i .. " has the wrong q_start")
@@ -212,40 +212,6 @@ local function hidden(w)
   return out
 end
 
--- The span id each new line should land in, by the spec's rules.
-local function deal(spans, first, last, k, prefer)
-  local out = {}
-  if first == last then
-    local id
-    for i, sp in ipairs(spans) do
-      local e = sp.q_start + sp.count
-      if first >= sp.q_start and first < e then
-        id = (first == sp.q_start and i > 1 and prefer == "above") and spans[i - 1].id or sp.id
-        break
-      elseif first == e and i == #spans then
-        id = sp.id
-      end
-    end
-    for j = 1, k do
-      out[j] = id
-    end
-    return out
-  end
-  local touched = {}
-  for _, sp in ipairs(spans) do
-    local rows = math.min(last, sp.q_start + sp.count) - math.max(first, sp.q_start)
-    if rows > 0 then
-      for _ = 1, rows do
-        touched[#touched + 1] = sp.id
-      end
-    end
-  end
-  for j = 1, k do
-    out[j] = touched[math.min(j, #touched)]
-  end
-  return out
-end
-
 -- Half the edits start at or next to an edge, where the bugs live.
 local function position(w, edges, n, back)
   if #edges == 0 or w.r(0, 1) == 0 then
@@ -254,42 +220,83 @@ local function position(w, edges, n, back)
   return math.max(0, math.min(n, edges[w.r(1, #edges)] + w.r(-back, 1)))
 end
 
-local function quilt_edit(w)
-  local n, edges = #w.quilt, {}
-  for _, sp in ipairs(w.m:spans()) do
-    edges[#edges + 1] = sp.q_start
+-- One replace call, the way the sync layer makes them, checked on its own.
+local function replace_one(w, sp, rf, rl, lines)
+  local spans, hid = w.m:spans(), hidden(w)
+  w.quilt = splice(w.quilt, sp.q_start + rf, sp.q_start + rl, lines)
+  local e = w.m:replace(sp.id, rf, rl, vim.deepcopy(lines))
+  local want = { src = sp.src, first = sp.src_start + rf, last = sp.src_start + rl, lines = lines }
+  if not vim.deep_equal(e, want) then
+    fail(w, "replace returned the wrong SrcEdit")
   end
-  local first = position(w, edges, n, 1)
-  local last = w.r(1, 3) == 1 and first or math.min(n, first + w.r(0, 4))
-  if w.r(1, 60) == 1 then
-    first, last = 0, n
-  end
-  local lines = new_lines(w, w.r(0, 4))
-  local prefer = w.r(1, 2) == 1 and "above" or "below"
-  w.op = { "quilt", first, last, lines, prefer }
-  local want = deal(w.m:spans(), first, last, #lines, prefer)
-  local hid = hidden(w)
-  w.quilt = splice(w.quilt, first, last, lines)
-  apply_src_edits(w, w.m:apply_quilt_change(first, last, vim.deepcopy(lines), prefer))
+  apply_src_edits(w, { e })
   check(w)
   if not vim.deep_equal(hidden(w), hid) then
-    fail(w, "a quilt edit changed source rows no span shows")
+    fail(w, "replace changed source rows no span shows")
   end
-  for j, id in ipairs(want) do
-    local at = w.m:locate(first + j - 1)
-    if not at or at.id ~= id then
-      fail(w, "new line " .. j .. " went to the wrong span")
+  local after = w.m:spans()
+  if #after ~= #spans then
+    fail(w, "replace added or dropped a span")
+  end
+  for i, x in ipairs(spans) do
+    local count = x.id == sp.id and x.count - (rl - rf) + #lines or x.count
+    if after[i].id ~= x.id or after[i].count ~= count then
+      fail(w, "replace changed the wrong span")
     end
   end
 end
 
-local function source_edit(w)
-  local s = w.r(1, #w.srcs)
+-- Random rows of a random span. Aims at collapsed spans a third of the time,
+-- and sometimes deletes a whole span so it collapses.
+local function replace(w)
+  local spans, folded = w.m:spans(), {}
+  for _, x in ipairs(spans) do
+    if x.count == 0 then
+      folded[#folded + 1] = x
+    end
+  end
+  local sp = (#folded > 0 and w.r(1, 3) == 1) and folded[w.r(1, #folded)] or spans[w.r(1, #spans)]
+  local rf, rl, lines
+  if w.r(1, 5) == 1 then
+    rf, rl, lines = 0, sp.count, {}
+  else
+    rf = w.r(0, sp.count)
+    rl = w.r(rf, math.min(sp.count, rf + 4))
+    lines = new_lines(w, w.r(0, 4))
+  end
+  w.op = { "replace", sp.id, rf, rl, lines }
+  replace_one(w, sp, rf, rl, lines)
+end
+
+-- A flush: one replace per span, top-down, each on the state the last left.
+local function flush(w)
+  w.op = { "flush" }
+  for _, x in ipairs(w.m:spans()) do
+    local sp = w.m:find(x.id)
+    local rf = w.r(0, sp.count)
+    local rl = w.r(rf, sp.count)
+    local lines = new_lines(w, w.r(0, 4))
+    table.insert(w.op, { sp.id, rf, rl, lines })
+    replace_one(w, sp, rf, rl, lines)
+  end
+end
+
+local function source_edit(w, aim)
+  local s = aim and aim.src or w.r(1, #w.srcs)
+  for _, sp in ipairs(aim and {} or w.m:spans()) do
+    if sp.count == 0 and w.r(0, 1) == 0 then
+      s, aim = sp.src, sp
+    end
+  end
   local n, edges = #w.srcs[s], {}
   for _, sp in ipairs(w.m:spans()) do
     if sp.src == s then
       vim.list_extend(edges, { sp.src_start, sp.src_start + sp.count })
     end
+  end
+  -- Around a collapsed span, most of the time, when there is one.
+  if aim and w.r(1, 4) > 1 then
+    edges = { aim.src_start }
   end
   local first = position(w, edges, n, 2)
   local last = w.r(1, 3) == 1 and first or math.min(n, first + w.r(0, 4))
@@ -298,8 +305,25 @@ local function source_edit(w)
   local touched = false
   for _, sp in ipairs(w.m:spans()) do
     local a, b = sp.src_start, sp.src_start + sp.count
-    if sp.src == s and ((first == last and a < first and first < b) or (first < last and a < last and b > first)) then
+    if
+      sp.src == s
+      and sp.count > 0
+      and ((first == last and a < first and first < b) or (first < last and a < last and b > first))
+    then
       touched = true
+    end
+  end
+  -- Collapsed spans go when inside the change, or at its edge when it grows
+  -- a span. Elsewhere they only shift.
+  local fates = {}
+  for _, sp in ipairs(w.m:spans()) do
+    if sp.src == s and sp.count == 0 then
+      local c, at = sp.src_start, sp.src_start
+      local gone = first < last and ((first < c and c < last) or (touched and (c == first or c == last)))
+      if (first == last and first <= c) or (first < last and last <= c) then
+        at = c + #lines - (last - first)
+      end
+      fates[#fates + 1] = { id = sp.id, at = not gone and at or nil }
     end
   end
   local before, quilt = shown(w), w.quilt
@@ -322,6 +346,41 @@ local function source_edit(w)
   end
   if not touched and not vim.deep_equal(quilt, w.quilt) then
     fail(w, "a change outside every span changed the quilt")
+  end
+  for _, f in ipairs(fates) do
+    local now = w.m:find(f.id)
+    if (now and now.src_start) ~= f.at or (now and now.count ~= 0) then
+      fail(w, "collapsed span " .. f.id .. " should be " .. (f.at and ("at " .. f.at) or "gone"))
+    end
+  end
+end
+
+-- Collapse a span, edit its source around it, then bring rows back.
+local function fold_cycle(w)
+  local spans, open = w.m:spans(), {}
+  for _, x in ipairs(spans) do
+    if x.count > 0 then
+      open[#open + 1] = x
+    end
+  end
+  if #open == 0 then
+    return replace(w)
+  end
+  local sp = open[w.r(1, #open)]
+  w.op = { "fold", sp.id }
+  replace_one(w, sp, 0, sp.count, {})
+  for _ = 1, w.r(1, 3) do
+    local now = w.m:find(sp.id)
+    if not now then
+      break
+    end
+    source_edit(w, now)
+  end
+  local now = w.m:find(sp.id)
+  if now and now.count == 0 then
+    local lines = new_lines(w, w.r(1, 4))
+    w.op = { "unfold", sp.id, lines }
+    replace_one(w, now, 0, 0, lines)
   end
 end
 
@@ -354,7 +413,8 @@ local function shrink(w)
   apply_q_edits(w, w.m:shrink(sp.id, above, below))
   check(w)
   local now = w.m:find(sp.id)
-  if not now or now.count ~= math.max(1, sp.count - above - below) then
+  local want = sp.count <= 1 and sp.count or math.max(1, sp.count - above - below)
+  if not now or now.count ~= want then
     fail(w, "shrink kept the wrong number of rows")
   end
   if now.src_start < sp.src_start or now.src_start + now.count > sp.src_start + sp.count then
@@ -377,11 +437,24 @@ end
 local function reload(w)
   local s = w.r(1, #w.srcs)
   local n = w.r(0, 1) == 0 and w.r(1, math.max(1, #w.srcs[s])) or w.r(1, 40)
+  -- Sometimes end the file right at a collapsed span, or just before it.
+  for _, sp in ipairs(w.m:spans()) do
+    if sp.src == s and sp.count == 0 and w.r(0, 1) == 0 then
+      n = math.max(1, sp.src_start - w.r(0, 1))
+    end
+  end
   local lines = new_lines(w, n)
   w.op = { "reload", s, n }
   w.srcs[s] = lines
+  local spans = w.m:spans()
   apply_q_edits(w, w.m:clamp(s, n))
   check(w)
+  for _, sp in ipairs(spans) do
+    local stays = sp.src ~= s or sp.src_start < n or (sp.count == 0 and sp.src_start == n)
+    if (w.m:find(sp.id) ~= nil) ~= stays then
+      fail(w, "clamp kept or dropped the wrong span " .. sp.id)
+    end
+  end
 end
 
 local function run(name, salt, ops)
@@ -392,15 +465,16 @@ local function run(name, salt, ops)
     w.step = step
     w.before = { srcs = vim.deepcopy(w.srcs), quilt = w.quilt, spans = w.m:spans() }
     ops[w.r(1, #ops)](w)
-    if w.m:line_count() == 0 or w.r(1, 150) == 1 then
+    local spans = w.m:spans()
+    if #spans == 0 or (w.m:line_count() == 0 and w.r(1, 4) == 1) or w.r(1, 150) == 1 then
       reset(w)
       check(w)
     end
   end
 end
 
-T["2000 random quilt edits keep every invariant"] = function()
-  run("quilt", 1, { quilt_edit })
+T["2000 random replace calls keep every invariant"] = function()
+  run("replace", 1, { replace, replace, replace, flush })
 end
 
 T["2000 random source edits keep every invariant"] = function()
@@ -408,7 +482,20 @@ T["2000 random source edits keep every invariant"] = function()
 end
 
 T["2000 mixed steps keep every invariant"] = function()
-  run("mixed", 3, { quilt_edit, quilt_edit, source_edit, source_edit, expand, shrink, remove, reload })
+  run("mixed", 3, {
+    replace,
+    replace,
+    flush,
+    fold_cycle,
+    fold_cycle,
+    source_edit,
+    source_edit,
+    source_edit,
+    expand,
+    shrink,
+    remove,
+    reload,
+  })
 end
 
 T["the same seed gives the same run"] = function()

@@ -31,6 +31,39 @@ function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts or {})
 end
 
+-- Excerpts the hits would make, counted before any file is loaded. Clamping at file edges can only merge
+-- more, so this never undercounts.
+local function estimate(hits, context)
+  local by = {}
+  for _, h in ipairs(hits) do
+    local key = h.bufnr or h.path
+    by[key] = by[key] or {}
+    table.insert(by[key], { h.row - context, (h.end_row or h.row + 1) + context })
+  end
+  local n = 0
+  for _, list in pairs(by) do
+    table.sort(list, function(x, y)
+      return x[1] < y[1]
+    end)
+    local stop = -math.huge
+    for _, r in ipairs(list) do
+      if r[1] > stop then
+        n = n + 1
+      end
+      stop = math.max(stop, r[2])
+    end
+  end
+  return n
+end
+
+local function unload(bufs)
+  for _, b in ipairs(bufs) do
+    if vim.api.nvim_buf_is_loaded(b) and not vim.bo[b].modified and #vim.fn.win_findbuf(b) == 0 then
+      pcall(vim.api.nvim_buf_delete, b, { unload = true })
+    end
+  end
+end
+
 ---Build a quilt from hits and show it in the current window.
 ---@param hits quilt.Hit[]
 ---@param title string
@@ -40,14 +73,15 @@ function M.open_hits(hits, title)
     notify("nothing to show for " .. title)
     return
   end
-  local ranges, created = require("quilt.sources").to_ranges(hits, M.config.context)
-  local count = #require("quilt.model").new(ranges):spans()
-  if count == 0 then
-    notify("nothing to show for " .. title)
+  local guess = estimate(hits, M.config.context)
+  if guess > M.config.max_excerpts then
+    notify(("%d excerpts is over max_excerpts (%d)"):format(guess, M.config.max_excerpts), vim.log.levels.WARN)
     return
   end
-  if count > M.config.max_excerpts then
-    notify(("%d excerpts is over max_excerpts (%d)"):format(count, M.config.max_excerpts), vim.log.levels.WARN)
+  local ranges, created = require("quilt.sources").to_ranges(hits, M.config.context)
+  if #require("quilt.model").new(ranges):spans() == 0 then
+    unload(created)
+    notify("nothing to show for " .. title)
     return
   end
   return require("quilt.buffer").open(ranges, {

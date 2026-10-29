@@ -128,7 +128,7 @@ function H.spans_of(child, qbuf, path)
   local buf = H.bufnr(child, path)
   local out = {}
   for _, s in ipairs(H.spans(child, qbuf)) do
-    if s.src == buf then
+    if s.src == buf and s.count > 0 then -- collapsed spans are hidden
       out[#out + 1] = { s.src_start, s.count }
     end
   end
@@ -154,7 +154,7 @@ function H.screen_rows(child)
 end
 
 -- The oracle: quilt text equals the concatenated source rows of each span, read from the real buffers.
--- Also checks count >= 1, q_start, and that spans of one source are contiguous, sorted, and non-overlapping.
+-- Also checks count >= 0 (0 is a collapsed span), q_start, and that spans of one source are contiguous, sorted, and non-overlapping.
 function H.check(child, qbuf)
   local r = child.lua(
     [[
@@ -165,7 +165,7 @@ function H.check(child, qbuf)
     local want, errs, seen, prev, last_src = {}, {}, {}, {}, nil
     for i, s in ipairs(spans) do
       local tag = ("span %d (id %s, src %s)"):format(i, tostring(s.id), tostring(s.src))
-      if s.count < 1 then errs[#errs + 1] = tag .. ": count " .. s.count end
+      if s.count < 0 then errs[#errs + 1] = tag .. ": count " .. s.count end
       if s.q_start ~= #want then errs[#errs + 1] = tag .. ": q_start " .. s.q_start .. ", want " .. #want end
       if not vim.api.nvim_buf_is_loaded(s.src) then errs[#errs + 1] = tag .. ": source not loaded" end
       if s.src ~= last_src then
@@ -181,7 +181,7 @@ function H.check(child, qbuf)
     end
     local lc = st.model:line_count()
     if lc ~= #want then errs[#errs + 1] = ("line_count %d, spans cover %d"):format(lc, #want) end
-    if #spans == 0 then want = { "" } end
+    if #want == 0 then want = { "" } end -- an empty quilt still holds one line
     return { errs = errs, want = want, got = vim.api.nvim_buf_get_lines(qbuf, 0, -1, false) }
   ]],
     { qbuf }

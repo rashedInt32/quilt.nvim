@@ -69,13 +69,13 @@ notice and opens nothing.
   shows up in the quilt.
 - Undo and redo work in the quilt like any edit and flow to the sources.
 - Deleting every line of an excerpt deletes those lines from the source and
-  removes the excerpt.
+  hides the excerpt. Undo brings the lines and the excerpt back.
 - A line inserted between two excerpts goes to the excerpt the cursor was in
   before the edit. `o` on the last line of one excerpt appends to it. `O` on
   the first line of the next prepends to that one.
 - An edit that spans two excerpts, like `J` across a header, does exactly that
-  to the sources: the new text goes to the first excerpt and the removed lines
-  leave the second.
+  to the sources: the joined line stays in the first file and leaves the
+  second. `:%s` that splits lines keeps every new line in its own file.
 
 ### Keys in the quilt
 
@@ -177,7 +177,7 @@ m:line_count()                       -- total quilt rows
 m:locate(qrow)                       -- span, src_row  | nil
 m:to_quilt(src, src_row)             -- qrow | nil
 m:find(id)                           -- span | nil
-m:apply_quilt_change(first, last, lines, prefer)  -- -> quilt.SrcEdit[]
+m:replace(id, rel_first, rel_last, lines)         -- -> quilt.SrcEdit
 m:apply_source_change(src, first, last, lines)    -- -> quilt.QEdit[]
 m:expand(id, above, below, src_line_count)        -- -> quilt.QEdit[]
 m:shrink(id, above, below)                        -- -> quilt.QEdit[]
@@ -192,29 +192,25 @@ Rules:
   below 1 are dropped.
 - Invariants after every call:
   1. Quilt text equals the source rows of each span, concatenated in order.
-  2. Every span has `count >= 1`.
+  2. Every span has `count >= 0`. A span with 0 rows is collapsed: it keeps
+     its place and its id so undo can bring its rows back, but it shows no
+     header and `locate` never returns it. `new` never makes one.
   3. Spans of one source are contiguous in the quilt and sorted by row.
   4. Spans of one source never overlap.
-- `apply_quilt_change(first, last, lines, prefer)` is called after quilt rows
-  `[first, last)` became `lines`.
-  - Rows removed from each span leave that span's source.
-  - New lines are dealt out row for row: each touched span, in order, gets
-    as many new lines as it had rows in the change, until the lines run out.
-    The last touched span also gets any lines left over. So `:%s` and `>`
-    keep every line in its own file, and `J` across an edge keeps the joined
-    line in the first file and removes it from the second.
-  - A pure insertion (`first == last`) at a boundary goes to the span above
-    when `prefer == "above"` and to the span below when `prefer == "below"`.
-    At row 0 it goes to the first span, and at the end it goes to the last.
-  - Spans left with no lines are removed.
-  - Later spans of the same source shift by the change in row count.
+- `replace(id, rel_first, rel_last, lines)` says the span's rows
+  `[rel_first, rel_last)`, counted from its own first row, became `lines`. It
+  returns the matching source edit, updates the span's count (which may reach
+  0), and shifts later spans: their `q_start`, and the `src_start` of later
+  spans of the same source. The sync layer decides which quilt rows belong to
+  which span. The model only keeps the books.
 - `apply_source_change(src, first, last, lines)` is called after source rows
   `[first, last)` became `lines`.
   - A change above a span shifts it. Insertion at the span's first row counts
     as above. Insertion at the row after its last row is outside.
   - A change that overlaps a span grows that span to cover the changed rows.
   - A change that overlaps several spans of the source merges them into one.
-  - A span left with no rows is removed.
+  - A span left with no rows is removed. A collapsed span inside a changed
+    region is removed too. A collapsed span outside it only shifts.
   - The returned edits use `lines` when the change is literal and
     `src`/`src_first`/`src_last` when the quilt must read context rows.
 - `expand` adds rows from the source, clamped to `[0, src_line_count)`, and
@@ -316,24 +312,46 @@ later), `win` (window to show it in, default current).
 
 How sync works:
 
-1. `nvim_buf_attach` on the quilt. `on_lines` asks the model for source edits
-   and queues them. Neovim raises E565 when another buffer is changed inside
-   `on_lines`, so the queue is flushed with `vim.schedule`.
-2. `nvim_buf_attach` on each source, once per quilt. `on_lines` asks the
-   model for quilt edits and queues them the same way.
-3. While the flush applies an edit, the matching `on_lines` ignores it. The
+1. Each span has an extmark at its first quilt row, column 0, with
+   `right_gravity = false`. Neovim moves these marks exactly through every
+   edit, `:s` with `\r`, `J`, `:m`, `:sort`, and undo and redo, which restore
+   them. on_lines alone can't do this: `:%s` reports one change over every
+   line, so it can't tell which new line belongs to which file.
+2. The quilt's `on_lines` only marks the quilt dirty and schedules a flush.
+   Neovim raises E565 when another buffer is changed inside `on_lines`.
+3. The flush reads the marks. A span runs from its mark to the next span's
+   mark. A mark in the middle of a line, as after `J`, starts the span on the
+   next line, so the joined line stays with the span above. Marks out of order,
+   as after `:m`, are clamped so each start is at least the one before. The
+   first span always starts at row 0.
+4. For each span, the flush compares its quilt rows with its source rows,
+   trims the common start and end, and applies what is left with
+   `model:replace` and `nvim_buf_set_lines` on the source. Then it puts every
+   mark back at its span's `q_start`.
+5. A pure insertion of whole lines at a span's first row is the one case the
+   marks can't decide: `o` on the last row of the span above and `O` on the
+   first row of the span below give the same change. `on_lines` handles it
+   at once. When the last span whose mark is at that row now covers exactly
+   the new rows, undo or redo just restored it, so the marks stay. Otherwise
+   the cursor row before the edit decides: a row above the insertion moves
+   those marks below the new lines, so they join the span above. A
+   `CursorMoved` and `CursorMovedI` autocmd records the cursor row.
+6. A quilt with no rows left, after `:%d`, still holds one empty line. When
+   every mark sits at row 0 and the quilt is that one empty line, every span
+   is collapsed and the line belongs to no span.
+7. Each source's `on_lines` asks the model for quilt edits, reads their text
+   at once, and queues them. The flush applies them before it looks at a
+   dirty quilt, then puts the marks back.
+8. While the flush applies an edit, the matching `on_lines` ignores it. The
    flag is per buffer and is set only around the `nvim_buf_set_lines` call.
-4. `prefer` comes from the cursor row before the edit. A `CursorMoved` and
-   `CursorMovedI` autocmd records it. When the row is at or after the
-   insertion row, the preference is "below".
-5. A source change that arrives while quilt edits are still queued would see
-   a model ahead of its buffer. In that case the quilt flushes first, then
-   rereads every span (`resync`).
-6. `on_reload` of a source calls `model:clamp`. `:e!` detaches instead of
+9. A source change that arrives while the quilt is dirty would race the
+   user's edit. The flush then rereads every span from the sources
+   (`resync`) and says so with a notice.
+10. `on_reload` of a source calls `model:clamp`. `:e!` detaches instead of
    reloading. So `on_detach` checks on the next tick: when the source is
    loaded again, it attaches again and clamps. Only when it stays unloaded
    are its spans removed.
-7. When the quilt is wiped, every callback returns true to detach. Buffers
+11. When the quilt is wiped, every callback returns true to detach. Buffers
    the quilt loaded are unloaded when they are not modified and not shown.
 
 Writing: `BufWriteCmd` on the quilt runs `:write` in each modified source

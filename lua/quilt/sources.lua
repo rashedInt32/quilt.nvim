@@ -44,6 +44,11 @@ function M.from_qf(list)
   end, hits)
 end
 
+-- A quilt never shows another quilt's rows.
+local function is_quilt(buf)
+  return vim.startswith(vim.api.nvim_buf_get_name(buf), "quilt://")
+end
+
 --- Hits from diagnostics at or above `min_severity`, all buffers.
 ---@param min_severity ("error"|"warn"|"info"|"hint"|integer)?
 ---@return quilt.Hit[]
@@ -52,7 +57,7 @@ function M.from_diagnostics(min_severity)
   local opts = sev and { severity = { min = sev } } or nil
   local hits = {}
   for _, d in ipairs(vim.diagnostic.get(nil, opts)) do
-    if vim.api.nvim_buf_is_valid(d.bufnr) then
+    if vim.api.nvim_buf_is_valid(d.bufnr) and not is_quilt(d.bufnr) then
       hits[#hits + 1] = {
         bufnr = d.bufnr,
         row = d.lnum,
@@ -250,7 +255,7 @@ function M.to_ranges(hits, context)
 
   local function resolve(hit)
     if hit.bufnr then
-      if not vim.api.nvim_buf_is_valid(hit.bufnr) then
+      if not vim.api.nvim_buf_is_valid(hit.bufnr) or is_quilt(hit.bufnr) then
         return nil
       end
       return hit.bufnr

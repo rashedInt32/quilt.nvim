@@ -9,6 +9,7 @@ local ns_diag = api.nvim_create_namespace("quilt.decor.diagnostics")
 
 ---@type table<integer, quilt.Span[]>
 local saved = {}
+local widths = {}
 local watched = {}
 
 M.statuscolumn = "%!v:lua.require'quilt.decor'.sc()"
@@ -31,11 +32,18 @@ local function priority_base()
   return hl.priorities.treesitter
 end
 
----@param spans quilt.Span[]
+---@param spans quilt.Span[] sorted by q_start
 ---@return quilt.Span|nil, integer|nil
 local function span_at(spans, qrow)
-  for _, s in ipairs(spans) do
-    if qrow >= s.q_start and qrow < s.q_start + s.count then
+  local lo, hi = 1, #spans
+  while lo <= hi do
+    local mid = math.floor((lo + hi) / 2)
+    local s = spans[mid]
+    if qrow < s.q_start then
+      hi = mid - 1
+    elseif qrow >= s.q_start + s.count then
+      lo = mid + 1
+    else
       return s, s.src_start + (qrow - s.q_start)
     end
   end
@@ -57,13 +65,10 @@ end
 function M.sc(lnum, virtnum)
   lnum = lnum or vim.v.lnum
   virtnum = virtnum or vim.v.virtnum
-  local buf = api.nvim_get_current_buf()
-  local spans = saved[buf] or {}
-  local last = 0
-  for _, s in ipairs(spans) do
-    last = math.max(last, s.src_start + s.count)
-  end
-  local width = math.max(#tostring(last), 3)
+  local win = vim.g.statusline_winid
+  local buf = (win and win ~= 0 and api.nvim_win_is_valid(win)) and api.nvim_win_get_buf(win)
+    or api.nvim_get_current_buf()
+  local width = widths[buf] or 3
   if virtnum ~= 0 then
     return string.rep(" ", width + 1)
   end
@@ -123,7 +128,37 @@ local function project_capture(qbuf, s, lang, name, node, metadata)
   })
 end
 
-local function draw_treesitter(qbuf, spans)
+local MARGIN = 20
+
+--- Quilt row ranges [first, last] visible in windows showing qbuf, or nil when none is shown.
+local function visible_ranges(qbuf)
+  local out = {}
+  for _, win in ipairs(vim.fn.win_findbuf(qbuf)) do
+    local r = api.nvim_win_call(win, function()
+      return { vim.fn.line("w0") - 1, vim.fn.line("w$") - 1 }
+    end)
+    out[#out + 1] = { r[1] - MARGIN, r[2] + MARGIN }
+  end
+  if #out == 0 then
+    return nil
+  end
+  return out
+end
+
+local function intersects(ranges, first, last)
+  if not ranges then
+    return true
+  end
+  for _, r in ipairs(ranges) do
+    if first <= r[2] and last >= r[1] then
+      return true
+    end
+  end
+  return false
+end
+
+---@return table<integer, quilt.Span[]>, integer[]
+local function group_by_src(spans)
   local by_src, order = {}, {}
   for _, s in ipairs(spans) do
     if not by_src[s.src] then
@@ -132,18 +167,28 @@ local function draw_treesitter(qbuf, spans)
     end
     table.insert(by_src[s.src], s)
   end
+  return by_src, order
+end
+
+local function draw_treesitter(qbuf, by_src, order)
   for _, src in ipairs(order) do
+    local group = by_src[src]
     if api.nvim_buf_is_loaded(src) then
       local ok, parser = pcall(vim.treesitter.get_parser, src, nil, { error = false })
       if ok and parser then
-        pcall(parser.parse, parser, true)
+        local lo, hi = math.huge, 0
+        for _, s in ipairs(group) do
+          lo = math.min(lo, s.src_start)
+          hi = math.max(hi, s.src_start + s.count)
+        end
+        pcall(parser.parse, parser, { lo, hi })
         parser:for_each_tree(function(tree, ltree)
           local lang = ltree:lang()
           local qok, query = pcall(vim.treesitter.query.get, lang, "highlights")
           if not qok or not query then
             return
           end
-          for _, s in ipairs(by_src[src]) do
+          for _, s in ipairs(group) do
             for id, node, metadata in query:iter_captures(tree:root(), src, s.src_start, s.src_start + s.count) do
               local name = query.captures[id]
               if name:sub(1, 1) ~= "_" and name ~= "spell" and name ~= "nospell" then
@@ -157,37 +202,95 @@ local function draw_treesitter(qbuf, spans)
   end
 end
 
-local function draw_diagnostics(qbuf, spans)
-  local out = {}
-  local seen = {}
-  for _, s in ipairs(spans) do
-    if not seen[s.src] and api.nvim_buf_is_valid(s.src) then
-      seen[s.src] = true
-    end
+local fallback_signs = { "E", "W", "I", "H" }
+
+local function sign_text(sev)
+  local ok, cfg = pcall(vim.diagnostic.config)
+  local signs = ok and cfg and cfg.signs
+  if type(signs) == "table" and type(signs.text) == "table" and signs.text[sev] then
+    return signs.text[sev]
   end
-  for src in pairs(seen) do
-    for _, d in ipairs(vim.diagnostic.get(src)) do
-      for _, s in ipairs(spans) do
-        local last = s.src_start + s.count - 1
-        if s.src == src and d.lnum >= s.src_start and d.lnum <= last then
-          local nd = vim.deepcopy(d)
-          nd.bufnr = qbuf
-          nd.lnum = d.lnum + s.q_start - s.src_start
-          if d.end_lnum and d.end_lnum > last then
-            nd.end_lnum = s.q_start + s.count - 1
-            nd.end_col = nil
-          elseif d.end_lnum then
-            nd.end_lnum = d.end_lnum + s.q_start - s.src_start
+  return fallback_signs[sev]
+end
+
+local function draw_diagnostics(qbuf, by_src, order)
+  for _, src in ipairs(order) do
+    local group = by_src[src]
+    if api.nvim_buf_is_valid(src) then
+      for _, d in ipairs(vim.diagnostic.get(src)) do
+        local s
+        local srow = d.lnum
+        -- group is sorted by src_start, so binary search on source rows
+        local lo, hi = 1, #group
+        while lo <= hi do
+          local mid = math.floor((lo + hi) / 2)
+          local g = group[mid]
+          if srow < g.src_start then
+            hi = mid - 1
+          elseif srow >= g.src_start + g.count then
+            lo = mid + 1
+          else
+            s = g
+            break
           end
-          out[#out + 1] = nd
+        end
+        if s then
+          local off = s.q_start - s.src_start
+          local sev = d.severity or vim.diagnostic.severity.ERROR
+          local name = ({ "Error", "Warn", "Info", "Hint" })[sev] or "Error"
+          local last = s.src_start + s.count - 1
+          local end_row, end_col = d.end_lnum or d.lnum, d.end_col
+          if end_row > last then
+            end_row, end_col = last + 1, 0
+          end
+          if end_row == d.lnum and (not end_col or end_col <= d.col) then
+            end_col = d.col + 1
+          end
+          local first_line = (d.message or ""):match("[^\n]*")
+          api.nvim_buf_set_extmark(qbuf, ns_diag, d.lnum + off, d.col, {
+            end_row = end_row + off,
+            end_col = end_col or 0,
+            hl_group = "DiagnosticUnderline" .. name,
+            sign_text = sign_text(sev),
+            sign_hl_group = "DiagnosticSign" .. name,
+            virt_text = { { first_line, "DiagnosticVirtualText" .. name } },
+            virt_text_pos = "eol",
+            strict = false,
+          })
         end
       end
     end
   end
-  vim.diagnostic.set(ns_diag, qbuf, out)
 end
 
---- Draw headers, highlights and diagnostics for a quilt. Idempotent.
+--- Redraw highlights and diagnostics for the rows visible in windows showing qbuf.
+--- With no window showing it, every span is drawn. Call from WinScrolled.
+---@param qbuf integer
+function M.render_visible(qbuf)
+  local spans = saved[qbuf]
+  if not spans or not api.nvim_buf_is_valid(qbuf) then
+    return
+  end
+  api.nvim_buf_clear_namespace(qbuf, ns_hl, 0, -1)
+  api.nvim_buf_clear_namespace(qbuf, ns_diag, 0, -1)
+  local ranges = visible_ranges(qbuf)
+  local vis = {}
+  for _, s in ipairs(spans) do
+    if intersects(ranges, s.q_start, s.q_start + s.count - 1) then
+      vis[#vis + 1] = s
+    end
+  end
+  local by_src, order = group_by_src(vis)
+  for _, g in pairs(by_src) do
+    table.sort(g, function(x, y)
+      return x.src_start < y.src_start
+    end)
+  end
+  draw_treesitter(qbuf, by_src, order)
+  draw_diagnostics(qbuf, by_src, order)
+end
+
+--- Draw headers for every span, then highlights and diagnostics for the visible ones. Idempotent.
 ---@param qbuf integer
 ---@param spans quilt.Span[]
 ---@param opts? table reserved
@@ -196,25 +299,28 @@ function M.render(qbuf, spans, opts) -- luacheck: ignore opts
     return
   end
   local copy = {}
-  for i, s in ipairs(spans) do
-    copy[i] = { id = s.id, src = s.src, src_start = s.src_start, q_start = s.q_start, count = s.count }
+  local last = 0
+  for _, s in ipairs(spans) do
+    if s.count > 0 then
+      copy[#copy + 1] = { id = s.id, src = s.src, src_start = s.src_start, q_start = s.q_start, count = s.count }
+      last = math.max(last, s.src_start + s.count)
+    end
   end
   saved[qbuf] = copy
+  widths[qbuf] = math.max(#tostring(last), 3)
   if not watched[qbuf] then
     watched[qbuf] = true
     api.nvim_create_autocmd("BufWipeout", {
       buffer = qbuf,
       once = true,
       callback = function()
-        saved[qbuf], watched[qbuf] = nil, nil
+        saved[qbuf], watched[qbuf], widths[qbuf] = nil, nil, nil
       end,
     })
   end
   api.nvim_buf_clear_namespace(qbuf, ns_head, 0, -1)
-  api.nvim_buf_clear_namespace(qbuf, ns_hl, 0, -1)
   draw_headers(qbuf, copy)
-  draw_treesitter(qbuf, copy)
-  draw_diagnostics(qbuf, copy)
+  M.render_visible(qbuf)
 end
 
 --- Scroll window `win` to the top with the first header (virtual lines above row 0) visible.

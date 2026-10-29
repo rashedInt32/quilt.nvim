@@ -113,7 +113,7 @@ T["new"]["spans have stable unique ids and correct q_start"] = function()
   m:remove(b)
   eq(ids(m), { a, c })
   eq(m:spans()[2].q_start, 3)
-  m:apply_quilt_change(0, 0, { "x" })
+  m:replace(a, 0, 0, { "x" })
   eq(ids(m), { a, c })
 end
 
@@ -164,193 +164,126 @@ T["queries"]["find returns the span or nil"] = function()
   eq(m:find(999), nil)
 end
 
-T["apply_quilt_change"] = MiniTest.new_set()
-
-T["apply_quilt_change"]["edit inside one span changes only that source row"] = function()
-  local m = fixture()
-  eq(m:apply_quilt_change(1, 2, { "x" }), { { src = 1, first = 3, last = 4, lines = { "x" } } })
-  eq(shape(m), { { 1, 2, 3 }, { 1, 8, 2 }, { 2, 0, 2 } })
-end
-
-T["apply_quilt_change"]["insert in the middle of a span shifts later spans of the same source"] = function()
-  local m = fixture()
-  eq(m:apply_quilt_change(1, 1, { "x", "y" }), { { src = 1, first = 3, last = 3, lines = { "x", "y" } } })
-  eq(shape(m), { { 1, 2, 5 }, { 1, 10, 2 }, { 2, 0, 2 } })
-  eq(m:spans()[3].q_start, 7)
-end
-
-T["apply_quilt_change"]["boundary insert with prefer above appends to the span above"] = function()
-  local m = fixture()
-  eq(m:apply_quilt_change(3, 3, { "x" }, "above"), { { src = 1, first = 5, last = 5, lines = { "x" } } })
-  eq(shape(m), { { 1, 2, 4 }, { 1, 9, 2 }, { 2, 0, 2 } })
-  eq(m:apply_quilt_change(6, 6, { "y" }, "above"), { { src = 1, first = 11, last = 11, lines = { "y" } } })
-  eq(shape(m), { { 1, 2, 4 }, { 1, 9, 3 }, { 2, 0, 2 } })
-end
-
-T["apply_quilt_change"]["boundary insert with prefer below prepends to the span below"] = function()
-  local m = fixture()
-  eq(m:apply_quilt_change(3, 3, { "x" }, "below"), { { src = 1, first = 8, last = 8, lines = { "x" } } })
-  eq(shape(m), { { 1, 2, 3 }, { 1, 8, 3 }, { 2, 0, 2 } })
-  eq(m:apply_quilt_change(6, 6, { "y" }, "below"), { { src = 2, first = 0, last = 0, lines = { "y" } } })
-  eq(shape(m), { { 1, 2, 3 }, { 1, 8, 3 }, { 2, 0, 3 } })
-end
-
-T["apply_quilt_change"]["boundary insert with no prefer goes below"] = function()
-  local m = fixture()
-  eq(m:apply_quilt_change(3, 3, { "x" }), { { src = 1, first = 8, last = 8, lines = { "x" } } })
-end
-
-T["apply_quilt_change"]["insert at row 0 and at the end"] = function()
-  local m = fixture()
-  eq(m:apply_quilt_change(0, 0, { "x" }, "above"), { { src = 1, first = 2, last = 2, lines = { "x" } } })
-  eq(shape(m), { { 1, 2, 4 }, { 1, 9, 2 }, { 2, 0, 2 } })
-  eq(m:apply_quilt_change(8, 8, { "y", "" }, "below"), { { src = 2, first = 2, last = 2, lines = { "y", "" } } })
-  eq(shape(m), { { 1, 2, 4 }, { 1, 9, 2 }, { 2, 0, 4 } })
-end
-
-T["apply_quilt_change"]["empty insert changes nothing"] = function()
-  local m = fixture()
-  eq(m:apply_quilt_change(2, 2, {}), {})
-  eq(M.new({}):apply_quilt_change(0, 0, { "x" }), {})
-end
-
-T["apply_quilt_change"]["delete all lines of a span removes it and deletes its source rows"] = function()
-  local m = fixture()
+-- The fixture with B's rows deleted from the quilt and the source.
+local function collapsed()
+  local m, srcs = fixture()
   local b = m:spans()[2].id
-  eq(m:apply_quilt_change(3, 5, {}), { { src = 1, first = 8, last = 10, lines = {} } })
-  eq(shape(m), { { 1, 2, 3 }, { 2, 0, 2 } })
-  eq(m:find(b), nil)
+  apply_src(srcs, { m:replace(b, 0, 2, {}) })
+  return m, srcs, b
 end
 
-T["apply_quilt_change"]["change spanning two spans of different sources (the J case)"] = function()
-  local m, srcs, quilt = fixture()
-  local edits = m:apply_quilt_change(4, 6, { "a9 b0" })
-  eq(edits, {
-    { src = 1, first = 9, last = 10, lines = { "a9 b0" } },
-    { src = 2, first = 0, last = 1, lines = {} },
-  })
-  eq(shape(m), { { 1, 2, 3 }, { 1, 8, 2 }, { 2, 0, 1 } })
-  apply_src(srcs, edits)
-  eq(view(m, srcs), splice(quilt, 4, 6, { "a9 b0" }))
-end
+T["replace"] = MiniTest.new_set()
 
-T["apply_quilt_change"]["change spanning two spans of the same source"] = function()
-  local m, srcs, quilt = fixture()
-  local edits = m:apply_quilt_change(2, 4, { "j", "k", "l" })
-  -- One line each, the leftover goes to the last span. The gap rows a5..a7
-  -- stay in the source, unseen.
-  eq(edits, {
-    { src = 1, first = 4, last = 5, lines = { "j" } },
-    { src = 1, first = 8, last = 9, lines = { "k", "l" } },
-  })
-  eq(shape(m), { { 1, 2, 3 }, { 1, 8, 3 }, { 2, 0, 2 } })
-  apply_src(srcs, edits)
-  eq(srcs[1], { "a0", "a1", "a2", "a3", "j", "a5", "a6", "a7", "k", "l", "a9", "a10", "a11" })
-  eq(view(m, srcs), splice(quilt, 2, 4, { "j", "k", "l" }))
-end
-
-T["apply_quilt_change"][":%s across three excerpts keeps every line in its own source"] = function()
-  local m, srcs, quilt = fixture()
-  local new = vim.tbl_map(function(l)
-    return l:upper()
-  end, quilt)
-  local edits = m:apply_quilt_change(0, 7, new)
-  eq(edits, {
-    { src = 1, first = 2, last = 5, lines = { "A2", "A3", "A4" } },
-    { src = 1, first = 8, last = 10, lines = { "A8", "A9" } },
-    { src = 2, first = 0, last = 2, lines = { "B0", "B1" } },
-  })
+T["replace"]["replace inside one span changes only that source row"] = function()
+  local m = fixture()
+  eq(m:replace(m:spans()[1].id, 1, 2, { "x" }), { src = 1, first = 3, last = 4, lines = { "x" } })
   eq(shape(m), { { 1, 2, 3 }, { 1, 8, 2 }, { 2, 0, 2 } })
-  apply_src(srcs, edits)
-  eq(view(m, srcs), new)
 end
 
-T["apply_quilt_change"]["> across an edge keeps every line in its own source"] = function()
-  local m, srcs = fixture()
-  local edits = m:apply_quilt_change(1, 6, { "\ta3", "\ta4", "\ta8", "\ta9", "\tb0" })
+T["replace"]["replace with more lines shifts later spans of the same source and every later q_start"] = function()
+  local m = fixture()
+  eq(m:replace(m:spans()[1].id, 1, 1, { "x", "y" }), { src = 1, first = 3, last = 3, lines = { "x", "y" } })
+  eq(shape(m), { { 1, 2, 5 }, { 1, 10, 2 }, { 2, 0, 2 } })
+  eq(
+    vim.tbl_map(function(s)
+      return s.q_start
+    end, m:spans()),
+    { 0, 5, 7 }
+  )
+end
+
+T["replace"]["replace inserts at rel 0 and appends at rel count"] = function()
+  local m, srcs, quilt = fixture()
+  local b = m:spans()[2].id
+  local e1 = m:replace(b, 0, 0, { "x" })
+  eq(e1, { src = 1, first = 8, last = 8, lines = { "x" } })
+  local e2 = m:replace(b, 3, 3, { "y" })
+  eq(e2, { src = 1, first = 11, last = 11, lines = { "y" } })
+  eq(shape(m), { { 1, 2, 3 }, { 1, 8, 4 }, { 2, 0, 2 } })
+  apply_src(srcs, { e1, e2 })
+  eq(view(m, srcs), { quilt[1], quilt[2], quilt[3], "x", "a8", "a9", "y", "b0", "b1" })
+end
+
+T["replace"]["replace of every row collapses the span"] = function()
+  local m, srcs, b = collapsed()
+  local spans = m:spans()
+  eq(#spans, 3)
+  eq(spans[2], { id = b, src = 1, src_start = 8, q_start = 3, count = 0 })
+  eq(spans[3].q_start, 3)
+  eq(m:find(b).count, 0)
+  eq(m:line_count(), 5)
+  eq(m:locate(3).id, spans[3].id)
+  eq(m:to_quilt(1, 8), nil)
+  eq(view(m, srcs), { "a2", "a3", "a4", "b0", "b1" })
+end
+
+T["replace"]["replace at rel 0 on a collapsed span brings its rows back"] = function()
+  local m, srcs, b = collapsed()
+  local e = m:replace(b, 0, 0, { "a8", "a9" })
+  eq(e, { src = 1, first = 8, last = 8, lines = { "a8", "a9" } })
+  eq(shape(m), { { 1, 2, 3 }, { 1, 8, 2 }, { 2, 0, 2 } })
+  apply_src(srcs, { e })
+  eq(srcs, { rows("a", 12), rows("b", 4) })
+end
+
+T["replace"][":%s with \\r across three excerpts keeps every line in its own source"] = function()
+  local m, srcs, quilt = fixture()
+  local want, edits = {}, {}
+  for _, s in ipairs(m:spans()) do
+    local new = {}
+    for i = 1, s.count do
+      vim.list_extend(new, { quilt[s.q_start + i]:upper(), "Y" })
+    end
+    vim.list_extend(want, new)
+    edits[#edits + 1] = m:replace(s.id, 0, s.count, new)
+  end
   eq(edits, {
-    { src = 1, first = 3, last = 5, lines = { "\ta3", "\ta4" } },
-    { src = 1, first = 8, last = 10, lines = { "\ta8", "\ta9" } },
-    { src = 2, first = 0, last = 1, lines = { "\tb0" } },
+    { src = 1, first = 2, last = 5, lines = { "A2", "Y", "A3", "Y", "A4", "Y" } },
+    { src = 1, first = 11, last = 13, lines = { "A8", "Y", "A9", "Y" } },
+    { src = 2, first = 0, last = 2, lines = { "B0", "Y", "B1", "Y" } },
   })
   apply_src(srcs, edits)
-  eq(view(m, srcs), { "a2", "\ta3", "\ta4", "\ta8", "\ta9", "\tb0", "b1" })
+  eq(view(m, srcs), want)
+  eq(srcs[2], { "B0", "Y", "B1", "Y", "b2", "b3" })
 end
 
-T["apply_quilt_change"]["J across an edge keeps the joined line in the first span"] = function()
+T["replace"]["J across an edge keeps the joined line in the first span"] = function()
   local m, srcs = fixture()
-  local edits = m:apply_quilt_change(2, 4, { "a4 a8" })
+  local a, b = unpack(ids(m))
+  local edits = { m:replace(a, 2, 3, { "a4 a8" }), m:replace(b, 0, 1, {}) }
   eq(edits, {
     { src = 1, first = 4, last = 5, lines = { "a4 a8" } },
     { src = 1, first = 8, last = 9, lines = {} },
   })
-  eq(shape(m), { { 1, 2, 3 }, { 1, 8, 1 }, { 2, 0, 2 } })
   apply_src(srcs, edits)
   eq(view(m, srcs), { "a2", "a3", "a4 a8", "a9", "b0", "b1" })
 end
 
-T["apply_quilt_change"]["dj across an edge deletes from both spans"] = function()
-  local m, srcs = fixture()
-  local edits = m:apply_quilt_change(4, 6, {})
-  eq(edits, {
-    { src = 1, first = 9, last = 10, lines = {} },
-    { src = 2, first = 0, last = 1, lines = {} },
-  })
-  apply_src(srcs, edits)
-  eq(view(m, srcs), { "a2", "a3", "a4", "a8", "b1" })
-end
-
-T["apply_quilt_change"]["fewer lines than rows fill the touched spans in order"] = function()
-  local m, srcs = fixture()
-  local c = m:spans()[3].id
-  local edits = m:apply_quilt_change(1, 6, { "x", "y" })
-  eq(edits, {
-    { src = 1, first = 3, last = 5, lines = { "x", "y" } },
-    { src = 1, first = 8, last = 10, lines = {} },
-    { src = 2, first = 0, last = 1, lines = {} },
-  })
-  eq(shape(m), { { 1, 2, 3 }, { 2, 0, 1 } })
-  eq(m:spans()[2].id, c)
-  apply_src(srcs, edits)
-  eq(view(m, srcs), { "a2", "x", "y", "b1" })
-end
-
-T["apply_quilt_change"]["delete the whole quilt"] = function()
-  local m, srcs = fixture()
-  local edits = m:apply_quilt_change(0, 7, {})
-  eq(edits, {
-    { src = 1, first = 2, last = 5, lines = {} },
-    { src = 1, first = 5, last = 7, lines = {} },
-    { src = 2, first = 0, last = 2, lines = {} },
-  })
-  eq(m:spans(), {})
-  eq(m:line_count(), 0)
-  apply_src(srcs, edits)
-  eq(srcs, { { "a0", "a1", "a5", "a6", "a7", "a10", "a11" }, { "b2", "b3" } })
-end
-
-T["apply_quilt_change"]["replacing the whole quilt with one line keeps it in the first span"] = function()
-  local m, srcs = fixture()
-  apply_src(srcs, m:apply_quilt_change(0, 7, { "x" }))
-  eq(shape(m), { { 1, 2, 1 } })
-  eq(view(m, srcs), { "x" })
-end
-
-T["apply_quilt_change"]["returned SrcEdits are valid when applied in order"] = function()
+T["replace"]["replace calls stay valid on the state each one left"] = function()
   local m, srcs, quilt = fixture()
+  local a, b, c = unpack(ids(m))
   local steps = {
-    { 1, 6, { "p", "q", "r", "s" } },
-    { 0, 2, { "t" } },
-    { 3, 3, { "u", "v" }, "above" },
-    { 2, 5, {} },
-    { 0, 1, { "w", "x", "y" } },
+    { a, 0, 3, { "p" } },
+    { b, 1, 2, { "q", "r", "s" } },
+    { c, 0, 2, {} },
+    { b, 0, 4, {} },
+    { b, 0, 0, { "t" } },
+    { c, 0, 0, { "u", "" } },
+    { a, 1, 1, { "v" } },
   }
   for _, st in ipairs(steps) do
-    quilt = splice(quilt, st[1], st[2], st[3])
-    apply_src(srcs, m:apply_quilt_change(st[1], st[2], st[3], st[4]))
+    local s = m:find(st[1])
+    quilt = splice(quilt, s.q_start + st[2], s.q_start + st[3], st[4])
+    apply_src(srcs, { m:replace(st[1], st[2], st[3], st[4]) })
     eq(view(m, srcs), quilt)
     eq(m:line_count(), #quilt)
   end
+end
+
+T["replace"]["replace with an unknown id returns nil"] = function()
+  local m = fixture()
+  eq(m:replace(999, 0, 0, { "x" }), nil)
+  eq(shape(m), { { 1, 2, 3 }, { 1, 8, 2 }, { 2, 0, 2 } })
 end
 
 T["apply_source_change"] = MiniTest.new_set()
@@ -452,6 +385,52 @@ T["apply_source_change"]["change in a source not in the quilt returns no edits"]
   eq(m:apply_source_change(9, 0, 3, { "x" }), {})
   eq(m:apply_source_change(1, 3, 3, {}), {})
   eq(shape(m), { { 1, 2, 3 }, { 1, 8, 2 }, { 2, 0, 2 } })
+end
+
+T["apply_source_change"]["a collapsed span outside the change only shifts"] = function()
+  local m, _, b = collapsed()
+  eq(m:apply_source_change(1, 0, 1, { "p", "q" }), {})
+  eq(m:find(b).src_start, 9)
+  eq(m:apply_source_change(1, 9, 9, { "x" }), {})
+  eq(m:find(b).src_start, 10)
+  eq(m:apply_source_change(1, 10, 11, { "z" }), {})
+  eq(m:find(b).src_start, 10)
+end
+
+T["apply_source_change"]["a collapsed span inside the change is removed"] = function()
+  local m, _, b = collapsed()
+  eq(m:apply_source_change(1, 6, 10, { "z" }), {})
+  eq(m:find(b), nil)
+  eq(shape(m), { { 1, 2, 3 }, { 2, 0, 2 } })
+end
+
+T["apply_source_change"]["a collapsed span at the edge of a change that grows a span is removed"] = function()
+  local m, srcs, b = collapsed()
+  local quilt = view(m, srcs)
+  srcs[1] = splice(srcs[1], 4, 8, { "z" })
+  local edits = m:apply_source_change(1, 4, 8, { "z" })
+  eq(edits, { { first = 2, last = 3, lines = { "z" } } })
+  eq(m:find(b), nil)
+  eq(shape(m), { { 1, 2, 3 }, { 2, 0, 2 } })
+  eq(apply_q(quilt, srcs, edits), view(m, srcs))
+end
+
+T["apply_source_change"]["a collapsed span inside the change does not count as growing a span"] = function()
+  local m, srcs, b = collapsed()
+  local a = m:spans()[1].id
+  apply_src(srcs, { m:replace(a, 0, 3, {}) })
+  eq(m:find(b).src_start, 5)
+  eq(m:apply_source_change(1, 2, 6, { "z" }), {})
+  eq(m:find(b), nil)
+  eq(m:find(a).src_start, 2)
+end
+
+T["apply_source_change"]["a collapsed span at the edge of a change that touches no span stays"] = function()
+  local m, _, b = collapsed()
+  eq(m:apply_source_change(1, 6, 8, {}), {})
+  eq(m:find(b).src_start, 6)
+  eq(m:apply_source_change(1, 6, 7, { "x", "y" }), {})
+  eq(m:find(b).src_start, 6)
 end
 
 T["expand / shrink / remove / clamp"] = MiniTest.new_set()
@@ -581,6 +560,34 @@ T["expand / shrink / remove / clamp"]["clamp after the source got shorter"] = fu
   eq(shape(m), { { 1, 2, 1 }, { 2, 0, 2 } })
   eq(ids(m), { a, c })
   eq(apply_q(quilt, srcs, edits), view(m, srcs))
+end
+
+T["expand / shrink / remove / clamp"]["expand grows a collapsed span"] = function()
+  local m, srcs, b = collapsed()
+  local quilt = view(m, srcs)
+  local edits = m:expand(b, 1, 1, #srcs[1])
+  eq(edits, {
+    { first = 3, last = 3, src = 1, src_first = 7, src_last = 8 },
+    { first = 4, last = 4, src = 1, src_first = 8, src_last = 9 },
+  })
+  eq(shape(m), { { 1, 2, 3 }, { 1, 7, 2 }, { 2, 0, 2 } })
+  eq(apply_q(quilt, srcs, edits), view(m, srcs))
+end
+
+T["expand / shrink / remove / clamp"]["shrink and remove of a collapsed span change no rows"] = function()
+  local m, _, b = collapsed()
+  eq(m:shrink(b, 1, 1), {})
+  eq(m:find(b).count, 0)
+  eq(m:remove(b), {})
+  eq(shape(m), { { 1, 2, 3 }, { 2, 0, 2 } })
+end
+
+T["expand / shrink / remove / clamp"]["clamp drops collapsed spans past the new end"] = function()
+  local m, _, b = collapsed()
+  eq(m:clamp(1, 8), { { first = 0, last = 3, src = 1, src_first = 2, src_last = 5 } })
+  eq(m:find(b).src_start, 8)
+  eq(m:clamp(1, 7), { { first = 0, last = 3, src = 1, src_first = 2, src_last = 5 } })
+  eq(m:find(b), nil)
 end
 
 return T
