@@ -154,7 +154,8 @@ function H.screen_rows(child)
 end
 
 -- The oracle: quilt text equals the concatenated source rows of each span, read from the real buffers.
--- Also checks count >= 0 (0 is a collapsed span), q_start, and that spans of one source are contiguous, sorted, and non-overlapping.
+-- Also checks count >= 0 (0 is a collapsed span), q_start, and that spans of one source are contiguous,
+-- sorted, and non-overlapping.
 function H.check(child, qbuf)
   local r = child.lua(
     [[

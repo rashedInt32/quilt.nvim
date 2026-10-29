@@ -68,6 +68,10 @@ notice and opens nothing.
 - Any change to a source, from another window, a formatter, or an LSP rename,
   shows up in the quilt.
 - Undo and redo work in the quilt like any edit and flow to the sources.
+  `u` after deleting a whole excerpt brings it back to its own file.
+- `+`, `-`, `zd`, `:Quilt refresh`, and `:e!` in the quilt clear the quilt's
+  undo history. Undoing them would otherwise delete source rows. Each source
+  keeps its own history.
 - Deleting every line of an excerpt deletes those lines from the source and
   hides the excerpt. Undo brings the lines and the excerpt back.
 - A line inserted between two excerpts goes to the excerpt the cursor was in
@@ -289,9 +293,13 @@ D.setup_highlights()          -- default links for the Quilt* groups
 - Treesitter projection reads captures from the source's parser for each
   span's rows and sets extmarks with the same `hl_group` and priority on the
   quilt rows. Captures that cross a span edge are clipped.
-- Diagnostics come from `vim.diagnostic.get(src)` and go into a quilt
-  namespace with rows mapped through the spans. Rows outside every span are
-  skipped.
+- Diagnostics come from `vim.diagnostic.get(src)` and are drawn as plain
+  extmarks (underline, sign, end-of-line text) in a quilt namespace. They
+  never go through `vim.diagnostic.set`, so the quilt adds no diagnostics of
+  its own to Trouble, statuslines, or `:Quilt diagnostics`.
+- `render` draws every header but projects highlights and diagnostics only
+  for spans near the visible rows of each window. `render_visible(qbuf)`
+  redraws that part and runs on `WinScrolled`.
 
 ### buffer.lua
 
@@ -344,18 +352,43 @@ How sync works:
    dirty quilt, then puts the marks back.
 8. While the flush applies an edit, the matching `on_lines` ignores it. The
    flag is per buffer and is set only around the `nvim_buf_set_lines` call.
-9. A source change that arrives while the quilt is dirty would race the
-   user's edit. The flush then rereads every span from the sources
-   (`resync`) and says so with a notice.
-10. `on_reload` of a source calls `model:clamp`. `:e!` detaches instead of
-   reloading. So `on_detach` checks on the next tick: when the source is
-   loaded again, it attaches again and clamps. Only when it stays unloaded
-   are its spans removed.
-11. When the quilt is wiped, every callback returns true to detach. Buffers
+9. A source change that arrives while the quilt is dirty, or a quilt edit
+   while source edits wait in the queue, is a race. The model still follows
+   every source change. The flush merges per span against the snapshot from
+   the last sync: a span only the quilt changed goes to its source, a span
+   only the source changed is reread, and a span both changed keeps the
+   source's version with an error notice. Then the quilt is reread.
+   Every source keeps a cached copy of its lines. Its changes are diffed with
+   `vim.diff` against that copy, so a formatter that rewrites the whole file
+   only touches the spans near rows that really changed.
+10. Keys in the quilt record intent: `o` and `O` say which side a new line
+   belongs to, even inside `:g` and `:normal`. `u`, `U`, `g-` mark an undo,
+   so restored marks are trusted. `<C-r>` and `g+` mark a redo, which reuses
+   the side the first run chose (kept per undo sequence number). Other pure
+   line insertions (`p`, `P`, `:put`, `.`) use the cursor row before the
+   edit, and only when the command did nothing else.
+11. A same-size rewrite of a range that drops several marks onto one row, as
+   `:sort` does, keeps each span's rows in place.
+12. `on_reload` of a source calls `model:clamp`. Some reloads detach instead.
+   So `on_detach` checks on the next tick: when the source is loaded again,
+   it attaches again and clamps. Only when it stays unloaded are its spans
+   removed.
+13. `:e!` in the quilt runs `BufReadCmd`, which rereads every span and
+   attaches again. `:bd` and `:bw` end the quilt.
+14. When the quilt is wiped, every callback returns true to detach. Buffers
    the quilt loaded are unloaded when they are not modified and not shown.
 
-Writing: `BufWriteCmd` on the quilt runs `:write` in each modified source
-with `nvim_buf_call`, then clears the quilt's modified flag.
+Writing: `BufWriteCmd` on the quilt (nested, so source autocmds run) runs
+`:write` in each modified source with `nvim_buf_call`, then clears the
+quilt's modified flag. `:w {file}` writes nothing and says so.
+
+## Known limits in v1
+
+- `:m` across an excerpt edge moves the edge with the line, because Neovim
+  moves extmarks with the text `:m` moves. The quilt shows where the line
+  went, and `:w` writes what it shows.
+- When two quilts change the same excerpt of one file in the same tick, the
+  second keeps the file's version and shows an error notice.
 
 ## Out of scope for v1
 

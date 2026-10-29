@@ -652,7 +652,8 @@ T["apply_text_edits over several rows of two sources at once"] = function()
       return { range = { start = { line = l1, character = c1 }, ["end"] = { line = l2, character = c2 } }, newText = t }
     end
     -- a: rename on rows 0, 4, 5 and insert two lines after row 5; b: join rows 2..3, edit outside the excerpt.
-    vim.lsp.util.apply_text_edits({ e(0, 0, 0, 1, "A"), e(4, 0, 4, 1, "A"), e(5, 2, 5, 2, "\nn1\nn2"), e(9, 0, 9, 1, "A") }, abuf, "utf-16")
+    local edits = { e(0, 0, 0, 1, "A"), e(4, 0, 4, 1, "A"), e(5, 2, 5, 2, "\nn1\nn2"), e(9, 0, 9, 1, "A") }
+    vim.lsp.util.apply_text_edits(edits, abuf, "utf-16")
     vim.lsp.util.apply_text_edits({ e(2, 2, 3, 0, " "), e(8, 0, 8, 0, "z") }, bbuf, "utf-16")
   ]],
     { H.bufnr(child, a), H.bufnr(child, b) }

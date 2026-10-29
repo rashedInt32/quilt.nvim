@@ -142,6 +142,16 @@ and drives it with keys.
 - [ ] after every e2e test, the quilt equals the source rows of each span
       (the same oracle as the fuzz test, read from real buffers)
 
+## 6b. adversarial and regression suites
+
+- tests/test_e2e_break.lua: 67 cases from the first breaker pass, aimed at
+  the old design. Two are skipped as known v1 limits (SPEC "Known limits").
+- tests/test_e2e_break2.lua: the second pass against the extmark design,
+  with a provenance oracle (every line names its file) and seeded random
+  walks.
+- tests/test_e2e_regress.lua: one test per bug found in review or in the
+  real-project session.
+
 ## 7. review gates
 
 - [ ] `make lint` clean (stylua, luacheck)

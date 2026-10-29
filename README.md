@@ -86,7 +86,21 @@ Set a key to `false` to turn it off.
 A new line between two excerpts goes to the excerpt the cursor was in. `o` on
 the last line of one excerpt adds to that file. `O` on the first line of the
 next adds to that one. Deleting every line of an excerpt deletes them from the
-file and removes the excerpt.
+file and hides the excerpt.
+
+Undo works across edges too. `u` after deleting a whole excerpt brings it
+back to its own file. `+`, `-`, `zd`, and `:Quilt refresh` change only what
+the quilt shows, so they clear the quilt's undo history. Each file keeps its
+own.
+
+Two edges I know about:
+
+- `:m` across an excerpt edge carries the edge with the line, because Neovim
+  moves marks with the text `:m` moves. The headers show where the line went,
+  and `:w` writes what you see.
+- If a file and the quilt change the same excerpt in the same moment, as with
+  two quilts over one file under `:windo`, the file's version wins and quilt
+  says so.
 
 ## Not yet
 
