@@ -2,6 +2,8 @@
 
 Edit many files from one buffer.
 
+Early: v0.1. The known limits are listed below.
+
 I search, find references, or open diagnostics, and Neovim gives me a quickfix
 list: one line per hit, no context, and a jump to another file for every
 change. quilt puts every hit in one buffer with real code around it. I edit
@@ -27,7 +29,8 @@ buffers get stitched together into one "quilt".
 
 ## Install
 
-Neovim 0.11 or newer. `rg` for grep, `git` for hunks. No other plugin.
+Neovim 0.12. It should work on 0.11, but I've only tested on 0.12. `rg` for
+grep, `git` for hunks. No other plugin.
 
 ```lua
 -- lazy.nvim
@@ -123,3 +126,7 @@ make test FILE=tests/test_model_fuzz.lua QUILT_SEED=42
 ```
 
 SPEC.md is the contract and TEST_PLAN.md lists every case.
+
+## License
+
+MIT
